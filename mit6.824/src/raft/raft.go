@@ -17,7 +17,11 @@ package raft
 //   in the same server.
 //
 
-import "sync"
+import (
+	"math/rand"
+	"sync"
+	"time"
+)
 import "labrpc"
 
 // import "bytes"
@@ -77,6 +81,7 @@ type Raft struct {
 	receivedQuit chan bool
 	quitCheckRoutine chan bool
 
+	timeout *time.Timer
 }
 
 // return currentTerm and whether this server
@@ -285,6 +290,19 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 //
 func (rf *Raft) Kill() {
 	// Your code here, if desired.
+	DPrintf("[Kill] me:%d", rf.me)
+	//加锁避免AppendEntries线程里写了ApplyMsg并返回response，但是未来得及持久化
+	//该线程Kill然后Make
+	rf.mu.Lock()
+	close(rf.receivedQuit)
+	close(rf.quitCheckRoutine)
+	rf.mu.Unlock()
+	DPrintf("[Kill] me:%d return", rf.me)
+}
+
+func (rf *Raft) ElectionTimeout() int {
+	r := rand.New(rand.NewSource(time.Now().UnixNano()))
+	return r.Intn(election_timeout_ms) + election_timeout_ms
 }
 
 //
@@ -306,10 +324,208 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
+	//2A
+	rf.changeToFollower = make(chan  ChangeToFollower)
+	rf.changeToFollowerDone = make(chan bool)
+	rf.receivedQuit = make(chan bool)
+	rf.quitCheckRoutine = make(chan bool)
+	rf.CurrentTerm = 0
+	rf.VotedFor = -1
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
+	rf.timeout = time.NewTimer(time.Duration(rf.ElectionTimeout()) * time.Millisecond)
 
+	//启动服务后，节点身份状态变为跟随者
+	go rf.BeFollower()
+	DPrintf("[Make] me:%d return", rf.me)
 	return rf
+}
+
+func (rf* Raft) BeFollower() {
+	DPrintf("[BeFollower] me:%d before for loop", rf.me)
+	rf.role = follower
+
+	for {
+		DPrintf("[BeFollower] me:%d begin wait select", rf.me)
+		select {
+		case v := <- rf.changeToFollower :
+			DPrintf("[BeFollower] me:%d CurrentTerm:%v changeToFollower:%v", rf.me, rf.CurrentTerm, v)
+			if v.term > rf.CurrentTerm {
+				go rf.TransitionToFollower(v)
+				return
+			}
+			rf.changeToFollowerDone <- true
+			if v.shouldResetTimer {
+				rf.timeout.Reset(time.Duration(rf.ElectionTimeout()) * time.Millisecond)
+			}
+		case <- rf.timeout.C:
+			//If a follower receives no communication over a period of time called the election timeout,
+			//then it assumes thers is no viable leader and begins an election to choose a new leader.
+			DPrintf("[BeFollower] me:%d timeout", rf.me)
+			go rf.BeCandidate()
+			return
+		case <- rf.receivedQuit:
+			DPrintf("[BeFollower] me:%d quit", rf.me)
+			return
+		}
+	}
+}
+
+func (rf *Raft) TransitionToFollower(changeToFollower ChangeToFollower) {
+	DPrintf("[TransitionToFollower] me:%d changeToFollower:%v CurrentTerm:%d role:%v", rf.me, changeToFollower, rf.CurrentTerm, rf.role)
+	rf.role = follower
+	if rf.CurrentTerm < changeToFollower.term {
+		rf.CurrentTerm = changeToFollower.term
+	}
+	if changeToFollower.votedFor != -1 {
+		rf.VotedFor = changeToFollower.votedFor
+	}
+	//为什么重置nextIndex?
+	//避免本身是旧leader，makeAppendEntryRequest还在使用nextIndex + rf.Logs构造AppendEntriesArgs
+	//而如果rf.Logs被新的leader截断，那么可能出现nextIndex > len(rf.Logs)情况，导致makeAppendEntryRequest里index out of range
+	//为什么重置nextIndex为0?
+	//注意nextIndex不能设置为len(logs)，比如以下场景：
+	//1. 发送AppendEntries时response，转化为follower，此时rf.Logs未修改，nextIndex = len(rf.Logs)
+	//2. 接着收到新leader的AppendEntries，可能删减rf.Logs
+	//3. BeFollower里的follower的case v:= <- changeToFollower触发，调用go rf.TransitionToFollower(v)后返回，释放AppendEntries函数里的锁
+	//4. makeAppendEntryRequest使用删减后的rf.Logs 与 未修改的nextIndex，可能出错
+	//5. go rf.TransitionToFollower(v)异步运行到这里，才设置nextIndex = len(rf.Logs)
+	//rf.InitNextIndex()
+	rf.persist()
+	rf.changeToFollowerDone <- true
+
+	if changeToFollower.shouldResetTimer {
+		rf.timeout.Reset(time.Duration(rf.ElectionTimeout()) * time.Millisecond)
+	}
+
+	rf.BeFollower()
+}
+
+func (rf *Raft) BeCandidate() {
+	DPrintf("[BeCandidate] me:%v begin.", rf.me)
+	rf.role = candidate
+	for {
+		vote_ended := make(chan bool, len(rf.peers))
+		go rf.StartElection(vote_ended)
+		rf.timeout.Reset(time.Duration(rf.ElectionTimeout()) * time.Millisecond)
+
+		select {
+		case v := <- rf.changeToFollower:
+			//If AppendEntries RPC received from new leader:convert to follower
+			DPrintf("[BeCandidate] me:%d changeToFollower:%v", rf.me, v)
+			go rf.TransitionToFollower(v)
+			return
+		case <- rf.receivedQuit:
+			DPrintf("[BeCandidate] me:%d quit", rf.me)
+			return
+		case win := <- vote_ended:
+			DPrintf("[BeCandidate] me:%d CurrentTerm:%v win:%v", rf.me, rf.CurrentTerm, win)
+			//If vote received from majority of servers:become leader
+			if win {
+				go rf.BeLeader()
+				return
+			}
+		case <- rf.timeout.C:
+			//If election timeout elapses:start new election
+			DPrintf("[BeCandidate] election timeout, start new election. me:%v CurrentTerm:%v", rf.me, rf.CurrentTerm)
+		}
+	}
+}
+
+func (rf *Raft) BeLeader() {
+	//异步避免 AE/RV里get lock后尝试push channel
+	//而这里尝试getlock后才pop channel
+	go func() {
+		rf.mu.Lock()
+		defer rf.mu.Unlock()
+		if rf.role != candidate {
+			return
+		}
+		//放在最后一步，在rf.SendLogEntryMessageToAll前判断是否是leader角色
+		rf.role = leader
+	}()
+
+	for {
+		select {
+		case v := <- rf.changeToFollower:
+			//turn to follower
+			DPrintf("[BeLeader] me:%d changeToFollower:%v", rf.me, v)
+			go rf.TransitionToFollower(v)
+			return
+		case <- rf.receivedQuit:
+			DPrintf("[BeLeader] me:%d quit", rf.me)
+			return
+		default:
+			DPrintf("[BeLeader] me:%d default. rf.role:%v", rf.me, rf.role)
+			//等待直到leader状态初始化完成
+			if rf.role == leader {
+				//Upon election: send initial empty AppendEntries RPCs(heartbeat) to each server;(这里我发送的可能不是empty)
+				//repeat during idle periods to prevent election timeouts.
+				//rf.SendLogEntryMessageToAll()
+				//Hint: The tester requires that the leader send heartbeat RPCs no more than then times persecond
+				time.Sleep(heart_beat_ms * time.Millisecond)
+			}
+		}
+	}
+}
+
+func (rf *Raft) StartElection(win chan bool) {
+	//On conversion to candidate, start election:
+	//1. Increment currentTerm
+	//2. Vote for self
+	//3. Reset election timer
+	//4. Send RequestVote RPCs to all other servers
+	server_count := len(rf.peers)
+	voted := make([]bool, server_count)
+
+	rf.mu.Lock()
+
+	//如果拿到锁后发现已经不是candidate，不再发起选举。
+	if rf.role != candidate {
+		rf.mu.Unlock()
+		return
+	}
+
+	rf.CurrentTerm++
+	rf.VotedFor = rf.me
+	rf.persist()
+	voted[rf.me] = true
+
+	var request RequestVoteArgs
+	request.Term = rf.CurrentTerm
+	request.CandidateId = rf.me
+	rf.mu.Unlock()
+
+	//send request vote RPCs to all other servers
+	for i := 0; i < server_count; i++ {
+		if i != rf.me {
+			//issues RequestVote RPCs in parallel to each of the other servers in the cluster
+			go func(server_index int, voted []bool) {
+				var reply RequestVoteReply
+				DPrintf("[StartElection] sendRequestVote from me:%d to server_index:%d request:%v", rf.me, server_index, request)
+				send_ok := rf.sendRequestVote(server_index, &request, &reply)
+				DPrintf("[StartElection] sendRequestVote from me:%d to server_index:%d currentTerm:%d send_ok:%v reply:%v", rf.me, server_index, rf.CurrentTerm, send_ok, reply)
+
+				voted[server_index] = send_ok && reply.VoteGranted
+
+				if CheckIfWinHalfVote(voted, server_count) {
+					//DPrintf("[StartElection] rf.me:%d voted:%v rf.Logs:%v rf.CurrentTerm:%v request:%v", rf.me, voted, rf.Logs, rf.CurrentTerm, request)
+					win <- true
+				}
+			}(i, voted)
+		}
+	}
+}
+
+func CheckIfWinHalfVote(voted []bool, server_count int) bool {
+	voted_count := 0
+	for  i := 0; i < server_count; i++ {
+		if voted[i] {
+			voted_count++
+		}
+	}
+	//win the vote if iut receives votes from a majority of the servers in the ful cluster for the same term.
+	return voted_count >= (server_count/2 + 1)
 }

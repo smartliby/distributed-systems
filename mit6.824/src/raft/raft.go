@@ -92,7 +92,7 @@ func (rf *Raft) GetState() (int, bool) {
 	term = rf.CurrentTerm
 	role := rf.role
 	isleader = (role == leader)
-	DPrintf("")
+	DPrintf("GetState me:%d term:%d votedFor:%d isleader:%v", rf.me, term, rf.VotedFor, isleader)
 	return term, isleader
 }
 
@@ -136,6 +136,9 @@ func (rf *Raft) readPersist(data []byte) {
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
+	//2A
+	Term int
+	CandidateId int
 }
 
 //
@@ -144,6 +147,9 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
+	//2A
+	Term int
+	VoteGranted bool
 }
 
 //
@@ -151,6 +157,59 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+	//响应投票
+	DPrintf("[RequestVote] me:%v currentTerm:%v args:%v", rf.me, rf.CurrentTerm, args)
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	reply.Term = rf.CurrentTerm
+	reply.VoteGranted = false
+
+	if rf.CurrentTerm > args.Term {
+		return
+	}
+
+	if rf.CurrentTerm < args.Term {
+		reply.Term = args.Term
+		reply.VoteGranted = true
+		var changeToFollower ChangeToFollower = ChangeToFollower{args.Term ,args.CandidateId, reply.VoteGranted}
+		DPrintf("[RequestVote] me:%d changeToFollower:%v", rf.me, changeToFollower)
+		rf.PushChangeToFollower(changeToFollower)
+	}
+}
+
+func (rf *Raft) PushChangeToFollower(changeToFollower ChangeToFollower) {
+	rf.changeToFollower <- changeToFollower
+	<- rf.changeToFollowerDone
+}
+
+//AppendEntries
+type AppendEntriesArgs struct {
+	//2A
+	Term int
+	LeaderId int
+}
+
+type AppendEntriesReply struct {
+	//2A
+	Term int
+	Success bool
+}
+
+//响应心跳
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	DPrintf("[AppendEntries] me:%d currentTerm:%v received AppendEntriesArgs:%v", rf.me, rf.CurrentTerm, args)
+
+	if rf.CurrentTerm > args.Term {
+		reply.Term = rf.CurrentTerm
+		reply.Success = false
+	}else {
+		reply.Term = args.Term
+		reply.Success = true
+	}
+	DPrintf("[AppendEntries] me:%d currentTerm:%d votedFor:%d", rf.me, rf.CurrentTerm, rf.VotedFor)
 }
 
 //
@@ -184,6 +243,12 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 //
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+	return ok
+}
+
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	// DPrintf("[sendAppendEntries] to server:%d request:%v", server, args)
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	return ok
 }
 

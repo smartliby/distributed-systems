@@ -27,8 +27,8 @@ import "labrpc"
 // import "bytes"
 // import "encoding/gob"
 
-const heart_beat_ms = 100
-const election_timeout_ms = 300
+const heart_beat_ms = 100				//心跳周期
+const election_timeout_ms = 300    	//选举超时时间
 
 const (
 	follower int = iota
@@ -73,15 +73,17 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 	//2A
-	CurrentTerm int		//节点已知的最后一个任期号（首次启动后从 0 开始递增）
-	VotedFor int		//当前任期内获得选票的候选人id（没有则为 null）
-	role int			//角色id
+	CurrentTerm int							//节点已知的最后一个任期号（首次启动后从 0 开始递增）
+	VotedFor int							//当前任期内获得选票的候选人id（没有则为 null）
+	role int								//角色id
 	changeToFollower chan ChangeToFollower
 	changeToFollowerDone chan bool
 	receivedQuit chan bool
 	quitCheckRoutine chan bool
 
-	timeout *time.Timer
+	followerAppendEntries chan bool
+
+	timeout *time.Timer						//定时器
 }
 
 // return currentTerm and whether this server
@@ -96,7 +98,7 @@ func (rf *Raft) GetState() (int, bool) {
 
 	term = rf.CurrentTerm
 	role := rf.role
-	isleader = (role == leader)
+	isleader = role == leader
 	DPrintf("GetState me:%d term:%d votedFor:%d isleader:%v", rf.me, term, rf.VotedFor, isleader)
 	return term, isleader
 }
@@ -159,10 +161,10 @@ type RequestVoteReply struct {
 
 //
 // example RequestVote RPC handler.
-//
+//响应投票
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
-	//响应投票
+
 	DPrintf("[RequestVote] me:%v currentTerm:%v args:%v", rf.me, rf.CurrentTerm, args)
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -213,6 +215,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}else {
 		reply.Term = args.Term
 		reply.Success = true
+
+		//if RPC request or response contains term T > currentTerm:
+		//set currentTerm = T, convert to follower
+		var changeToFollower ChangeToFollower = ChangeToFollower{args.Term, args.LeaderId, true}
+		DPrintf("[AppendEntries] me:%v changeToFollower:%v response:%v", rf.me, changeToFollower, reply)
+		rf.PushChangeToFollower(changeToFollower)
 	}
 	DPrintf("[AppendEntries] me:%d currentTerm:%d votedFor:%d", rf.me, rf.CurrentTerm, rf.VotedFor)
 }
@@ -255,6 +263,21 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	// DPrintf("[sendAppendEntries] to server:%d request:%v", server, args)
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	return ok
+}
+
+func (rf *Raft) makeAppendEntryRequest(server_index int) (*AppendEntriesArgs, int) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if rf.role != leader {
+		return nil, -1
+	}
+	endIndex := -1
+	request := &AppendEntriesArgs{}
+	request.Term = rf.CurrentTerm
+	request.LeaderId = rf.me
+
+	return request, endIndex
 }
 
 
@@ -435,15 +458,13 @@ func (rf *Raft) BeCandidate() {
 }
 
 func (rf *Raft) BeLeader() {
-	//异步避免 AE/RV里get lock后尝试push channel
-	//而这里尝试getlock后才pop channel
+	//异步避免死锁问题 AE/RV里get lock后尝试push channel，而这里尝试getlock后才pop channel
 	go func() {
 		rf.mu.Lock()
 		defer rf.mu.Unlock()
 		if rf.role != candidate {
 			return
 		}
-		//放在最后一步，在rf.SendLogEntryMessageToAll前判断是否是leader角色
 		rf.role = leader
 	}()
 
@@ -463,7 +484,7 @@ func (rf *Raft) BeLeader() {
 			if rf.role == leader {
 				//Upon election: send initial empty AppendEntries RPCs(heartbeat) to each server;(这里我发送的可能不是empty)
 				//repeat during idle periods to prevent election timeouts.
-				//rf.SendLogEntryMessageToAll()
+				rf.SendLogEntryMessageToAll()
 				//Hint: The tester requires that the leader send heartbeat RPCs no more than then times persecond
 				time.Sleep(heart_beat_ms * time.Millisecond)
 			}
@@ -528,4 +549,67 @@ func CheckIfWinHalfVote(voted []bool, server_count int) bool {
 	}
 	//win the vote if iut receives votes from a majority of the servers in the ful cluster for the same term.
 	return voted_count >= (server_count/2 + 1)
+}
+
+func (rf *Raft) CheckMatchIndexAndSetCommitIndex() {
+	DPrintf("[CheckMatchIndexAndSetCommitIndex] rf.me:%v begin.", rf.me)
+	for {
+		select {
+		case <-rf.quitCheckRoutine:
+			DPrintf("[CheckMatchIndexAndSetCommitIndex] rf.me:%v quit.", rf.me)
+			return
+		case <-rf.followerAppendEntries:
+		}
+	}
+	DPrintf("[CheckMatchIndexAndSetCommitIndex] rf.me:%v end.", rf.me)
+}
+
+func (rf *Raft) SendLogEntryMessageToAll() {
+	DPrintf("[SendLogEntryMessageToAll] me:%d begin", rf.me)
+	server_count := len(rf.peers)
+
+	for i := 0; i < server_count; i++ {
+		if i != rf.me {
+			go func(server_index int) {
+				//makeAppendEntryRequest需要加锁
+				//因此需要放到该异步函数里
+				//如果放到外面，由于对于leader，SendLogEntryMessageToAll是一个同步函数
+				//例如以下场景会出现deadlock: AppendEntries获取了锁，尝试changeToFollower <- true
+				//如果同步的话，则需要先获取锁，然后case <- changeToFollower
+				request, _ := rf.makeAppendEntryRequest(server_index)
+				if request == nil {
+					return
+				}
+				var response AppendEntriesReply
+				DPrintf("[SendLogEntryMessageToAll] from me:%d to server_index:%d request:%v", rf.me, server_index, request)
+				send_ok := rf.sendAppendEntries(server_index, request, &response)
+
+				rf.mu.Lock()
+				sameTerm := request.Term == rf.CurrentTerm
+				rf.mu.Unlock()
+				//判断request.Term == rf.CurrentTerm，避免是之前term 的RPCResponse
+				if send_ok && sameTerm {
+					//If successful: update nextIndex and matchIndex for follower.
+					if response.Success {
+						rf.followerAppendEntries <- true
+					} else {
+						//If AppendEntries fails because of log inconsistency:
+						//decrement nextIndex and retry.
+						if response.Term == rf.CurrentTerm {
+
+						} else if response.Term > rf.CurrentTerm {
+							//If RPC request or response contains term T > currentTerm
+							//set currentTerm = T, convert to follower.
+							var changeToFollower ChangeToFollower = ChangeToFollower{response.Term, -1, false}
+							DPrintf("[SendLogEntryMessageToAll] me:%v currentTerm:%v changeToFollower:%v by server:%v response:%v", rf.me, rf.CurrentTerm, changeToFollower, server_index, response)
+							//we don't know who is leader, set -1.
+							rf.PushChangeToFollower(changeToFollower)
+						}
+					}
+				}
+				DPrintf("[SendLogEntryMessageToAll] from me:%d to server_index:%d send_ok:%t response:%v", rf.me, server_index, send_ok, response)
+			}(i)
+		}
+	}
+	DPrintf("[SendLogEntryMessageToAll] me:%d end", rf.me)
 }

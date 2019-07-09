@@ -83,6 +83,18 @@ type Raft struct {
 
 	followerAppendEntries chan bool
 
+	//2B
+	//index of highest log entry known to be committed(initialize to 0, increases monotonically)
+	commitIndex int
+	//log entries;each entry contains command for state machine, and term when entry was received by leader(first index is 1)
+	Logs []LogEntry
+	//for each server, index of the next log entry to send to that server(initialized to leader last log index + 1)
+	nextIndex []int
+	//for each server, index of highest log entry known to be replicated on server(initialized to 0, increases monotonically)
+	//这里我省略了lastApplied，使用matchIndex[rf.me]替代
+	matchIndex []int
+	applyCh chan ApplyMsg
+
 	timeout *time.Timer						//定时器
 }
 

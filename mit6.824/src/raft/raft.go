@@ -18,6 +18,8 @@ package raft
 //
 
 import (
+	"bytes"
+	"encoding/gob"
 	"math/rand"
 	"sort"
 	"sync"
@@ -130,6 +132,13 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := gob.NewEncoder(w)
+	e.Encode(rf.CurrentTerm)
+	e.Encode(rf.VotedFor)
+	e.Encode(rf.Logs)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 //
@@ -145,6 +154,16 @@ func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	r := bytes.NewBuffer(data)
+	d := gob.NewDecoder(r)
+	d.Decode(&rf.CurrentTerm)
+	d.Decode(&rf.VotedFor)
+	d.Decode(&rf.Logs)
+	DPrintf("[readPersist] me:%v CurrentTerm:%v VotedFor:%v Logs:%v", rf.me, rf.CurrentTerm, rf.VotedFor, rf.Logs)
 }
 
 

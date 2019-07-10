@@ -19,6 +19,7 @@ package raft
 
 import (
 	"math/rand"
+	"sort"
 	"sync"
 	"time"
 )
@@ -158,6 +159,9 @@ type RequestVoteArgs struct {
 	//2A
 	Term int
 	CandidateId int
+	//2B
+	LastLogIndex int
+	LastLogTerm int
 }
 
 //
@@ -181,16 +185,26 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	reply.Term = rf.CurrentTerm
-	reply.VoteGranted = false
-
 	if rf.CurrentTerm > args.Term {
+		reply.Term = rf.CurrentTerm
+		reply.VoteGranted = false
 		return
 	}
 
-	if rf.CurrentTerm < args.Term {
+	//term相等，比较日志大小
+	lastLogIndex := len(rf.Logs) -1
+	lastLogTerm := rf.Logs[lastLogIndex].Term
+
+	if rf.CurrentTerm < args.Term && (args.LastLogTerm > lastLogTerm || (args.LastLogTerm == lastLogTerm && args.LastLogIndex >= lastLogIndex)) {
 		reply.Term = args.Term
 		reply.VoteGranted = true
+		DPrintf("[RequestVote] me:%d votedFor:%d VoteGranted:true", rf.me, rf.VotedFor)
+	}else {
+		reply.Term = rf.CurrentTerm
+		reply.VoteGranted = false
+	}
+
+	if rf.CurrentTerm < args.Term {
 		var changeToFollower ChangeToFollower = ChangeToFollower{args.Term ,args.CandidateId, reply.VoteGranted}
 		DPrintf("[RequestVote] me:%d changeToFollower:%v", rf.me, changeToFollower)
 		rf.PushChangeToFollower(changeToFollower)
@@ -207,12 +221,22 @@ type AppendEntriesArgs struct {
 	//2A
 	Term int
 	LeaderId int
+
+	//2B
+	PrevLogIndex int
+	PrevLogTerm int
+	Entries []LogEntry
+	LeaderCommitIndex int
 }
 
 type AppendEntriesReply struct {
 	//2A
 	Term int
 	Success bool
+
+	//2B
+	ConflictIndex int
+	ConflictTerm int
 }
 
 //响应心跳
@@ -225,16 +249,71 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Term = rf.CurrentTerm
 		reply.Success = false
 	}else {
-		reply.Term = args.Term
-		reply.Success = true
+		log_len := len(rf.Logs)
+		//2. Reply false if log doesn't contain an entry at prevLogIndex whose term matches prevLogTerm
+		log_is_less := log_len < args.PrevLogIndex + 1
+		log_dismatch := !log_is_less && args.PrevLogIndex > 0 && (rf.Logs[args.PrevLogIndex].Term != args.PrevLogTerm)
+		if log_is_less || log_dismatch {
+			reply.Term = args.Term
+			reply.Success = false
+
+			if log_is_less {
+				reply.ConflictTerm = -1
+				reply.ConflictIndex = log_len
+			} else if log_dismatch {
+				reply.ConflictTerm = rf.Logs[args.PrevLogIndex].Term
+				for i := 0; i < log_len; i++ {
+					if rf.Logs[i].Term == reply.ConflictTerm {
+						reply.ConflictIndex = i
+						break
+					}
+				}
+			}
+		} else {
+			//3. If an existing entry conflicts with a new one(same index but different terms), delete the existing entry and all that follow it.
+			if len(rf.Logs) - 1 != args.PrevLogIndex {
+				rf.Logs = rf.Logs[:args.PrevLogIndex + 1]
+			}
+			//4. Append any new entries not already in the log
+			rf.Logs = append(rf.Logs, args.Entries...)
+
+			last_commit_index := rf.commitIndex
+			//5. If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
+			last_new_entry := len(rf.Logs) - 1
+			if last_new_entry > args.LeaderCommitIndex {
+				rf.commitIndex = args.LeaderCommitIndex
+			} else {
+				rf.commitIndex = last_new_entry
+			}
+			rf.NotifyApplyCh(last_commit_index);
+
+			reply.Term = args.Term
+			reply.Success = true
+		}
 
 		//if RPC request or response contains term T > currentTerm:
 		//set currentTerm = T, convert to follower
 		var changeToFollower ChangeToFollower = ChangeToFollower{args.Term, args.LeaderId, true}
-		DPrintf("[AppendEntries] me:%v changeToFollower:%v response:%v", rf.me, changeToFollower, reply)
+		DPrintf("[AppendEntries] me:%v changeToFollower:%v response:%v log_is_less:%v log_dismatch:%v", rf.me, changeToFollower, reply, log_is_less, log_dismatch)
 		rf.PushChangeToFollower(changeToFollower)
 	}
 	DPrintf("[AppendEntries] me:%d currentTerm:%d votedFor:%d", rf.me, rf.CurrentTerm, rf.VotedFor)
+}
+
+func (rf *Raft) NotifyApplyCh(last_commit int) {
+	commitIndex := rf.commitIndex
+	//持久化，注意这里不判断commitIndex != last_commit才persist
+	//因为对follower而言，这次AppendEntriesArgs可能是新的日志 + 新日志之前的commitIndex
+	//在follower返回true之后，leader commit了新的日志，如果follower不持久化而重启导致丢失了这些新的log
+	//之后leader重启，该follower同意选取其他日志较少的leader，新的leader可能覆盖掉之前commit的内容。
+	rf.persist()
+
+	//这里不能设置为异步push数据到rf.applyCh
+	//因为同一server可能连续调用两次，而config里的检查需要对Index有顺序要求
+	for i := last_commit + 1; i <= commitIndex; i++ {
+		DPrintf("[NotifyApplyCh] me:%d push to applyCh, Index:%v Command:%v", rf.me, i, rf.Logs[i].Command)
+		rf.applyCh <- ApplyMsg{Index:i, Command:rf.Logs[i].Command}
+	}
 }
 
 //
@@ -284,10 +363,23 @@ func (rf *Raft) makeAppendEntryRequest(server_index int) (*AppendEntriesArgs, in
 	if rf.role != leader {
 		return nil, -1
 	}
-	endIndex := -1
 	request := &AppendEntriesArgs{}
 	request.Term = rf.CurrentTerm
 	request.LeaderId = rf.me
+
+	newLogEntryStartIndex := rf.nextIndex[server_index]
+	endIndex := len(rf.Logs)
+	prevLogIndex := newLogEntryStartIndex - 1
+	if prevLogIndex < 0 {
+		prevLogIndex = 0
+	}
+	request.PrevLogIndex = prevLogIndex
+	request.PrevLogTerm = rf.Logs[prevLogIndex].Term
+
+	if newLogEntryStartIndex != -1 && endIndex > 0 {
+		request.Entries = rf.Logs[newLogEntryStartIndex:endIndex]
+	}
+	request.LeaderCommitIndex = rf.commitIndex
 
 	return request, endIndex
 }
@@ -312,7 +404,25 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	DPrintf("[Start] me:%v command:%v rf.role:%v", rf.me, command, rf.role)
 
+	isLeader = rf.role == leader
+
+	if isLeader {
+		index = rf.nextIndex[rf.me]
+		term = rf.CurrentTerm
+
+		//If command received from client: append entry to local log, respond after entry applied to state machine(push to ApplyMsg)
+		rf.Logs = append(rf.Logs, LogEntry{command, term})
+		rf.nextIndex[rf.me]++
+		rf.matchIndex[rf.me] = rf.nextIndex[rf.me] - 1
+
+		rf.persist()
+
+		DPrintf("[Start] me:%d command:%v index:%v rf.Logs:%v", rf.me, command, index, rf.Logs)
+	}
 
 	return index, term, isLeader
 }
@@ -333,6 +443,12 @@ func (rf *Raft) Kill() {
 	close(rf.quitCheckRoutine)
 	rf.mu.Unlock()
 	DPrintf("[Kill] me:%d return", rf.me)
+}
+
+func (rf *Raft) InitNextIndex() {
+	for i := 0; i < len(rf.peers); i++ {
+		rf.nextIndex[i] = 1
+	}
 }
 
 func (rf *Raft) ElectionTimeout() int {
@@ -364,16 +480,23 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.changeToFollowerDone = make(chan bool)
 	rf.receivedQuit = make(chan bool)
 	rf.quitCheckRoutine = make(chan bool)
+	rf.followerAppendEntries = make(chan bool)
 	rf.CurrentTerm = 0
 	rf.VotedFor = -1
 
+	rf.applyCh = applyCh
+	rf.nextIndex = make([]int, len(peers))
+	rf.Logs = append(rf.Logs, LogEntry{-1, rf.CurrentTerm})
+	rf.InitNextIndex()
+	rf.matchIndex = make([]int, len(peers))
+
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
-
 	rf.timeout = time.NewTimer(time.Duration(rf.ElectionTimeout()) * time.Millisecond)
 
 	//启动服务后，节点身份状态变为跟随者
 	go rf.BeFollower()
+	go rf.CheckMatchIndexAndSetCommitIndex()
 	DPrintf("[Make] me:%d return", rf.me)
 	return rf
 }
@@ -427,7 +550,7 @@ func (rf *Raft) TransitionToFollower(changeToFollower ChangeToFollower) {
 	//3. BeFollower里的follower的case v:= <- changeToFollower触发，调用go rf.TransitionToFollower(v)后返回，释放AppendEntries函数里的锁
 	//4. makeAppendEntryRequest使用删减后的rf.Logs 与 未修改的nextIndex，可能出错
 	//5. go rf.TransitionToFollower(v)异步运行到这里，才设置nextIndex = len(rf.Logs)
-	//rf.InitNextIndex()
+	rf.InitNextIndex()
 	rf.persist()
 	rf.changeToFollowerDone <- true
 
@@ -477,6 +600,15 @@ func (rf *Raft) BeLeader() {
 		if rf.role != candidate {
 			return
 		}
+		//When a leader first comes to power
+		//it initializes all nextIndex values to the index just after the last one in its log.
+		for i := 0; i < len(rf.nextIndex); i++ {
+			rf.nextIndex[i] = len(rf.Logs)
+		}
+		//首先rf.matchIndex[rf.me]需要和rf.nextIndex[rf.me]一致，否则只有当调用Start时才更新rf.nextIndex[rf.me]
+		rf.matchIndex[rf.me] = len(rf.Logs) - 1
+
+		//放在最后一步，在rf.SendLogEntryMessageToAll前判断是否是leader角色
 		rf.role = leader
 	}()
 
@@ -529,6 +661,8 @@ func (rf *Raft) StartElection(win chan bool) {
 	var request RequestVoteArgs
 	request.Term = rf.CurrentTerm
 	request.CandidateId = rf.me
+	request.LastLogIndex = len(rf.Logs) - 1
+	request.LastLogTerm = rf.Logs[request.LastLogIndex].Term
 	rf.mu.Unlock()
 
 	//send request vote RPCs to all other servers
@@ -565,13 +699,39 @@ func CheckIfWinHalfVote(voted []bool, server_count int) bool {
 
 func (rf *Raft) CheckMatchIndexAndSetCommitIndex() {
 	DPrintf("[CheckMatchIndexAndSetCommitIndex] rf.me:%v begin.", rf.me)
+	majorityIndex := (len(rf.peers) - 1) / 2
 	for {
 		select {
-		case <-rf.quitCheckRoutine:
+		case <- rf.quitCheckRoutine:
 			DPrintf("[CheckMatchIndexAndSetCommitIndex] rf.me:%v quit.", rf.me)
 			return
-		case <-rf.followerAppendEntries:
+		case <- rf.followerAppendEntries:
 		}
+
+		rf.mu.Lock()
+		//If there exists an N such that N > commitIndex, a majority of matchIndex[i] >= N,
+		//and log[N].term == currentTerm: set commitIndex = N
+		last_commit_index := rf.commitIndex
+		matchIndex := append([]int{}, rf.matchIndex...)
+		sort.Ints(matchIndex)
+
+		commit_index_majority := matchIndex[majorityIndex]
+		new_commit_on_majority := (last_commit_index < commit_index_majority) && (commit_index_majority < len(rf.Logs)) && (rf.Logs[commit_index_majority].Term == rf.CurrentTerm)
+		//for example, if that entry is stored on every server
+		commit_index_all := matchIndex[0]
+		new_commit_on_all := (last_commit_index < commit_index_all) && (commit_index_all < len(rf.Logs))
+		DPrintf("[CheckMatchIndexAndSetCommitIndex] rf.me:%v matchIndex:%v last_commit_index:%v", rf.me, rf.matchIndex, last_commit_index)
+
+		if new_commit_on_majority {
+			DPrintf("[CheckMatchIndexAndSetCommitIndex] commitIndex:%v->%v by majority me:%d currentTerm:%v rf.Logs:%v", last_commit_index, commit_index_majority, rf.me, rf.CurrentTerm, rf.Logs)
+			rf.commitIndex = commit_index_majority
+			rf.NotifyApplyCh(last_commit_index)
+		} else if new_commit_on_all {
+			DPrintf("[CheckMatchIndexAndSetCommitIndex] commitIndex:%v->%v by all me:%d currentTerm:%v rf.Logs:%v", last_commit_index, commit_index_all, rf.me, rf.CurrentTerm, rf.Logs)
+			rf.commitIndex = commit_index_all
+			rf.NotifyApplyCh(last_commit_index)
+		}
+		rf.mu.Unlock()
 	}
 	DPrintf("[CheckMatchIndexAndSetCommitIndex] rf.me:%v end.", rf.me)
 }
@@ -588,7 +748,7 @@ func (rf *Raft) SendLogEntryMessageToAll() {
 				//如果放到外面，由于对于leader，SendLogEntryMessageToAll是一个同步函数
 				//例如以下场景会出现deadlock: AppendEntries获取了锁，尝试changeToFollower <- true
 				//如果同步的话，则需要先获取锁，然后case <- changeToFollower
-				request, _ := rf.makeAppendEntryRequest(server_index)
+				request, max_log_entry_index := rf.makeAppendEntryRequest(server_index)
 				if request == nil {
 					return
 				}
@@ -603,12 +763,14 @@ func (rf *Raft) SendLogEntryMessageToAll() {
 				if send_ok && sameTerm {
 					//If successful: update nextIndex and matchIndex for follower.
 					if response.Success {
+						rf.nextIndex[server_index] = max_log_entry_index
+						rf.matchIndex[server_index] = max_log_entry_index - 1
 						rf.followerAppendEntries <- true
 					} else {
 						//If AppendEntries fails because of log inconsistency:
 						//decrement nextIndex and retry.
 						if response.Term == rf.CurrentTerm {
-
+							rf.HandleInconsistency(server_index, &response)
 						} else if response.Term > rf.CurrentTerm {
 							//If RPC request or response contains term T > currentTerm
 							//set currentTerm = T, convert to follower.
@@ -624,4 +786,24 @@ func (rf *Raft) SendLogEntryMessageToAll() {
 		}
 	}
 	DPrintf("[SendLogEntryMessageToAll] me:%d end", rf.me)
+}
+
+func (rf *Raft) HandleInconsistency(server_index int, response *AppendEntriesReply) {
+	DPrintf("[HandleInconsistency] before log inconsistency: me:%d server_index:%d rf.nextIndex:%v", rf.me, server_index, rf.nextIndex)
+
+	rf.mu.Lock()
+	nextIndex := -1
+	for j := 1; j < len(rf.Logs) - 1; j++ {
+		if rf.Logs[j].Term == response.Term && rf.Logs[j + 1].Term != response.Term {
+			nextIndex = j + 1
+			break
+		}
+	}
+	if response.ConflictTerm == -1 || nextIndex == -1 {
+		rf.nextIndex[server_index] = response.ConflictIndex
+	} else {
+		rf.nextIndex[server_index] = nextIndex
+	}
+	rf.mu.Unlock()
+	DPrintf("[HandleInconsistency] after log inconsistency: me:%d server_index:%d rf.nextIndex:%v", rf.me, server_index, rf.nextIndex)
 }

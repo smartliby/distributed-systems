@@ -812,12 +812,15 @@ func (rf *Raft) HandleInconsistency(server_index int, response *AppendEntriesRep
 
 	rf.mu.Lock()
 	nextIndex := -1
+
+	//可以减少不必要的日志同步
 	for j := 1; j < len(rf.Logs) - 1; j++ {
-		if rf.Logs[j].Term == response.Term && rf.Logs[j + 1].Term != response.Term {
+		if rf.Logs[j].Term == response.ConflictTerm && rf.Logs[j + 1].Term != response.ConflictTerm {
 			nextIndex = j + 1
 			break
 		}
 	}
+
 	if response.ConflictTerm == -1 || nextIndex == -1 {
 		rf.nextIndex[server_index] = response.ConflictIndex
 	} else {
